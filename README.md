@@ -172,7 +172,5 @@ Do whatever you want, hust don't be evil.
 
 ## Final note
 
-- This project was started before OpenClaw existed.
-- It has since evolved into a native tool-calling agent.
 - It is intended to integrate with other Termux projects, including Termux-TUI.
 - Improvements, suggestions, and testing are welcome.
