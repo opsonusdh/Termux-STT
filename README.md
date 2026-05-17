@@ -166,7 +166,7 @@ Sounds such as keyboards, fans, traffic, birds, or other environmental noise may
 
 MIT
 
-Do whatever you want, hust don't be evil.
+Do whatever you want, just don't be evil.
 
 ---
 

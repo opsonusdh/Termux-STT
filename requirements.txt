@@ -1,2 +1,3 @@
-sounddevice
-webrtcvad
+sounddevice>=0.4.6
+webrtcvad>=2.0.10
+numpy>=1.24
