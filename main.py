@@ -89,20 +89,49 @@ if MODEL_PATH is None:
 
 
 
-#  TEXT CLEANING 
+# Full-string noise-only matcher
+# Examples removed:
+#   (Noise)
+#   (Noise) *Noise*
+#   [Music] {Noise}
+#   * Noise * (music)
+#
+# Examples kept:
+#   (Noise) hello
+#   hello (noise)
+#   test [music] test
 
-# Whisper noise tokens: (Music), [BLANK_AUDIO], [noise], etc. — anywhere
-_NOISE_RE  = re.compile(r"[\[\(][^\]\)]{0,40}[\]\)]", re.IGNORECASE)
-# Leading dashes / whitespace whisper sometimes emits
+_NOISE_RE = re.compile(
+    r"""
+    ^
+    (?:
+        [\s\-–—]*                         # optional spacing/separators
+
+        [\[\(\{\*]                        # opening
+        \s*
+        [a-z _-]{1,40}                    # token text
+        \s*
+        [\]\)\}\*]                        # closing
+
+        [\s\-–—]*                         # optional spacing/separators
+    )+
+    $
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 _LEADER_RE = re.compile(r"^[\s\-–—]+")
-# Collapse internal whitespace runs
 _SPACE_RE  = re.compile(r"\s{2,}")
 
 
 def _clean_text(text: str) -> str:
-    text = _NOISE_RE.sub("", text)
+    # Remove ONLY if entire line is noise markers
+    if _NOISE_RE.fullmatch(text.strip()):
+        return ""
+
     text = _LEADER_RE.sub("", text)
     text = _SPACE_RE.sub(" ", text)
+
     return text.strip()
 
 
