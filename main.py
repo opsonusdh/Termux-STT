@@ -1,8 +1,13 @@
+import atexit
+import http.client
+import io
+import json
 import os
 import queue
 import re
 import subprocess
 import tempfile
+import time
 import wave
 import warnings as _warnings
 from collections import deque
@@ -12,10 +17,6 @@ import numpy as np
 import sounddevice as sd
 
 try:
-    # webrtcvad imports pkg_resources internally for its own version check.
-    # pkg_resources is deprecated in newer setuptools and emits a UserWarning.
-    # We suppress it by matching the warning message text, since the warning
-    # originates from webrtcvad.py itself (not from the pkg_resources module).
     with _warnings.catch_warnings():
         _warnings.filterwarnings("ignore", message=".*pkg_resources.*")
         _warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -26,39 +27,47 @@ except ImportError:
     print("[warn] webrtcvad not found — falling back to energy-only VAD")
     print("[warn] Install with: pip install webrtcvad --break-system-packages")
 
-# CONFIG
-SAMPLE_RATE     = 16000
-CHANNELS        = 1
-BLOCK_DURATION  = 0.10   # 100 ms blocks → more responsive VAD
-SILENCE_TIMEOUT = 1.2    # seconds of silence before committing
-MIN_SPEECH_SEC  = 0.4    # skip clips shorter than this (avoids noise hits)
-ENERGY_THRESHOLD = 0.02  # fallback if calibration is skipped
-MIN_SPEECH_FRAMES = 2    # loud frames needed before we'll open a recording
-PRE_ROLL_FRAMES   = 6    # frames prepended before speech onset
+#  CONFIG 
+
+SAMPLE_RATE = 16000
+CHANNELS = 1
+BLOCK_DURATION = 0.10  # 100 ms blocks
+
+# Normal endpointing: wait for silence before committing.
+SILENCE_TIMEOUT = 1.2
+
+# When the stream grows too long, we do NOT cut mid-word.
+# We only arm a pending commit and then wait for the next silence edge.
+MAX_RECORDING_SEC_STREAM = 20.0
+FORCE_COMMIT_SILENCE_TIMEOUT = 0.35
+
+MIN_SPEECH_SEC = 0.5
+ENERGY_THRESHOLD = 0.02
+MIN_SPEECH_FRAMES = 1
+PRE_ROLL_FRAMES = 6
+
+# Snapdragon cores are not a suggestion.
+WHISPER_THREADS = 2
 
 # CALIBRATION
-# At startup we sample CALIBRATION_SEC seconds of silence, measure the 95th
-# percentile RMS, then set the live threshold to that × THRESHOLD_MULTIPLIER.
-# This adapts to any mic and room automatically.
-CALIBRATION_SEC      = 1.5
-THRESHOLD_MULTIPLIER = 3.0   # gap between noise floor and speech; raise if
-                              # ambient noise still leaks through
-THRESHOLD_FLOOR = 0.015      # never go below this (near-silent room protection)
-THRESHOLD_CEIL  = 0.12       # never go above this (very noisy room protection)
+CALIBRATION_SEC = 1.5
+THRESHOLD_MULTIPLIER = 3.0
+THRESHOLD_FLOOR = 0.015
+THRESHOLD_CEIL = 0.12
 
-# webrtcvad aggressiveness: 0 = least aggressive, 3 = most aggressive.
-# 2 is a good balance — 3 cuts off word onsets before voicing is established.
+# webrtcvad
 VAD_AGGRESSIVENESS = 2
-
-# What fraction of 30 ms sub-frames in a block must be speech for the
-# block to count as speech (majority vote across the 100 ms window)
 VAD_SPEECH_RATIO = 0.7
 
-BASE_DIR    = Path(__file__).resolve().parent
-MODELS_DIR  = BASE_DIR / "whisper.cpp" / "models"
+# Whisper-server (persistent process — eliminates per-clip model-load overhead)
+_SERVER_HOST = "127.0.0.1"
+_SERVER_PORT = 8178
 
-# FIX: try both binary names — newer whisper.cpp uses "whisper-cli",
-# older builds used "main". Avoids a silent FileNotFoundError on older clones.
+#  PATHS 
+
+BASE_DIR = Path(__file__).resolve().parent
+MODELS_DIR = BASE_DIR / "whisper.cpp" / "models"
+
 WHISPER_PATH = None
 for _bin in ("whisper-cli", "main"):
     _p = BASE_DIR / "whisper.cpp" / "build" / "bin" / _bin
@@ -72,18 +81,12 @@ if WHISPER_PATH is None:
         "Did you run setup.sh? Looked for: whisper-cli, main"
     )
 
-# Pick the best available model automatically (priority: large → tiny)
 MODEL_PRIORITY = [
-    "ggml-large.bin",
-    "ggml-large-v3.bin",
-    "ggml-medium.en.bin",
-    "ggml-medium.bin",
-    "ggml-base.en.bin",
-    "ggml-base.bin",
-    "ggml-small.en.bin",
-    "ggml-small.bin",
-    "ggml-tiny.en.bin",
-    "ggml-tiny.bin",
+    "ggml-large.bin", "ggml-large-v3.bin",
+    "ggml-medium.en.bin", "ggml-medium.bin",
+    "ggml-base.en.bin",  "ggml-base.bin",
+    "ggml-small.en.bin", "ggml-small.bin",
+    "ggml-tiny.en.bin",  "ggml-tiny.bin",
 ]
 
 MODEL_PATH = None
@@ -99,13 +102,12 @@ if MODEL_PATH is None:
         "Download one with: bash whisper.cpp/models/download-ggml-model.sh base.en"
     )
 
-# TEXT CLEANING
-# Whisper noise tokens: (Music), [BLANK_AUDIO], [noise], etc. — anywhere
-_NOISE_RE  = re.compile(r"[\[\(][^\]\)]{0,40}[\]\)]", re.IGNORECASE)
-# Leading dashes / whitespace whisper sometimes emits
+#  TEXT CLEANING 
+
+_NOISE_RE = re.compile(r"[\[\(][^\]\)]{0,40}[\]\)]", re.IGNORECASE)
 _LEADER_RE = re.compile(r"^[\s\-–—]+")
-# Collapse internal whitespace runs
-_SPACE_RE  = re.compile(r"\s{2,}")
+_SPACE_RE = re.compile(r"\s{2,}")
+
 
 def _clean_text(text: str) -> str:
     text = _NOISE_RE.sub("", text)
@@ -113,72 +115,198 @@ def _clean_text(text: str) -> str:
     text = _SPACE_RE.sub(" ", text)
     return text.strip()
 
-# VOICE ACTIVITY DETECTION
-# Initialise once at module level so there's no per-frame overhead
+#  VAD 
+
 _vad = _webrtcvad.Vad(VAD_AGGRESSIVENESS) if _VAD_AVAILABLE else None
 
-# webrtcvad only accepts exactly 10 / 20 / 30 ms frames at 16 kHz
-_VAD_FRAME_MS      = 30
+_VAD_FRAME_MS = 30
 _VAD_FRAME_SAMPLES = int(SAMPLE_RATE * _VAD_FRAME_MS / 1000)  # 480 samples
-_VAD_FRAME_BYTES   = _VAD_FRAME_SAMPLES * 2                    # int16 → 2 bytes
+_VAD_FRAME_BYTES = _VAD_FRAME_SAMPLES * 2  # int16 → 2 bytes
+
 
 def _is_voice(audio: np.ndarray) -> bool:
-    """
-    Return True if the audio block contains human voice.
-
-    Strategy: split the 100 ms block into 30 ms sub-frames, run WebRTC VAD
-    on each, and require at least VAD_SPEECH_RATIO of them to be classified
-    as speech (majority vote). Falls back to True (trust energy alone)
-    when webrtcvad is not installed.
-    """
     if _vad is None:
-        return True  # graceful degradation
-
-    pcm   = (audio * 32767).astype(np.int16).tobytes()
+        return True
+    pcm = (audio * 32767).astype(np.int16).tobytes()
     total = speech = 0
-
     for start in range(0, len(pcm) - _VAD_FRAME_BYTES + 1, _VAD_FRAME_BYTES):
-        frame  = pcm[start : start + _VAD_FRAME_BYTES]
+        frame = pcm[start : start + _VAD_FRAME_BYTES]
         total += 1
         try:
             if _vad.is_speech(frame, SAMPLE_RATE):
                 speech += 1
         except Exception:
-            speech += 1  # if VAD errors on a frame, don't penalise it
-
+            speech += 1
     if total == 0:
         return False
+    return (speech / total) >= VAD_SPEECH_RATIO
 
-    ratio = speech / total
-    return ratio >= VAD_SPEECH_RATIO
+#  AUDIO / WAV 
 
-# AUDIO HELPERS
-def _frames_to_wav(frames: list, path: str) -> None:
-    """Normalize and write a float32 frame list to a 16-bit WAV file."""
-    audio = np.array(frames, dtype=np.float32)
-    peak  = np.abs(audio).max()
+def _frames_to_wav_bytes(frames: list) -> bytes:
+    """
+    Convert a list of float32 numpy chunks to WAV bytes held in memory.
+    """
+    audio = np.concatenate(frames).astype(np.float32) if frames else np.array([], dtype=np.float32)
+    peak = np.abs(audio).max() if audio.size else 0.0
     if peak > 1e-6:
-        audio = audio * min(1.0, 0.9 / peak)  # normalise; never clip
+        audio = audio * min(1.0, 0.9 / peak)
     int_audio = (audio * 32767).astype(np.int16)
-    with wave.open(path, "wb") as wf:
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as wf:
         wf.setnchannels(CHANNELS)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
         wf.writeframes(int_audio.tobytes())
+    return buf.getvalue()
 
-def _transcribe_wav(wav_path: str, cleaned: bool = True) -> str:
+#  PERSISTENT WHISPER SERVER 
+
+class _WhisperServer:
+    """
+    Manages a persistent whisper-server subprocess.
+    """
+
+    def __init__(self):
+        self._proc = None
+        self._ready = False
+        _bin = BASE_DIR / "whisper.cpp" / "build" / "bin" / "whisper-server"
+        self._bin = str(_bin) if _bin.exists() else None
+
+    @property
+    def available(self) -> bool:
+        return self._bin is not None
+
+    def start(self, debug: bool = False) -> bool:
+        if not self.available:
+            return False
+
+        cmd = [
+            self._bin,
+            "-m", MODEL_PATH,
+            "-t", str(WHISPER_THREADS),
+            "--host", _SERVER_HOST,
+            "--port", str(_SERVER_PORT),
+            "-l", "en",
+        ]
+        if debug:
+            print(f"[server] starting: {' '.join(cmd)}")
+
+        try:
+            self._proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as e:
+            print(f"[server] failed to start process: {e}")
+            return False
+
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline:
+            if self._proc.poll() is not None:
+                print("[server] process exited unexpectedly during startup")
+                return False
+            try:
+                conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=1)
+                conn.request("GET", "/health")
+                resp = conn.getresponse()
+                resp.read()
+                if resp.status == 200:
+                    self._ready = True
+                    print("[server] whisper-server ready — model loaded once, zero per-clip overhead ✓")
+                    return True
+            except Exception:
+                pass
+            time.sleep(0.5)
+
+        print("[server] timed out waiting for ready — falling back to subprocess mode")
+        self.stop()
+        return False
+
+    def transcribe(self, wav_bytes: bytes, cleaned: bool = True) -> str:
+        """POST wav_bytes to /inference, return transcript string."""
+        boundary = "termuxsttbdy"
+        header = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="audio.wav"\r\n'
+            f"Content-Type: audio/wav\r\n\r\n"
+        ).encode("ascii")
+        footer = f"\r\n--{boundary}--\r\n".encode("ascii")
+        body = header + wav_bytes + footer
+
+        try:
+            conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=30)
+            conn.request(
+                "POST", "/inference",
+                body=body,
+                headers={
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                    "Content-Length": str(len(body)),
+                },
+            )
+            resp = conn.getresponse()
+            raw = resp.read().decode("utf-8")
+            if resp.status == 200:
+                text = json.loads(raw).get("text", "").strip()
+                return _clean_text(text) if cleaned else text
+            print(f"[server] HTTP {resp.status}: {raw[:120]}")
+        except Exception as e:
+            print(f"[server] request failed: {e} — marking unhealthy")
+            self._ready = False
+
+        return ""
+
+    def stop(self):
+        if self._proc:
+            try:
+                self._proc.terminate()
+                self._proc.wait(timeout=5)
+            except Exception:
+                pass
+            self._proc = None
+        self._ready = False
+
+
+_server = _WhisperServer()
+atexit.register(_server.stop)
+
+#  TRANSCRIPTION ENTRY POINT 
+
+def _transcribe(frames: list, cleaned: bool = True) -> str:
+    """
+    Unified transcription call.
+    """
+    wav_bytes = _frames_to_wav_bytes(frames)
+
+    if _server._ready:
+        return _server.transcribe(wav_bytes, cleaned)
+
+    fd, wav_path = tempfile.mkstemp(suffix=".wav")
+    try:
+        os.close(fd)
+        with open(wav_path, "wb") as f:
+            f.write(wav_bytes)
+        return _transcribe_subprocess(wav_path, cleaned)
+    finally:
+        try:
+            os.remove(wav_path)
+        except FileNotFoundError:
+            pass
+
+
+def _transcribe_subprocess(wav_path: str, cleaned: bool = True) -> str:
+    """Original subprocess path — kept as fallback."""
     cmd = [
         WHISPER_PATH,
         "-m", MODEL_PATH,
         "-f", wav_path,
-        "-nt",      # no timestamps
-        "-l", "en", # force language (helps tiny model)
-        "-t", "2",  # threads — safe on most Android devices
+        "-nt",
+        "-l", "en",
+        "-t", str(WHISPER_THREADS),
     ]
     try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=30
-        )
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     except subprocess.TimeoutExpired:
         print("[whisper] Timeout — skipping segment")
         return ""
@@ -192,15 +320,12 @@ def _transcribe_wav(wav_path: str, cleaned: bool = True) -> str:
     raw = result.stdout.strip()
     return _clean_text(raw) if cleaned else raw
 
-# CORE GENERATOR
+#  CALIBRATION 
+
 def _calibrate(debug: bool = False) -> float:
-    """
-    Sample CALIBRATION_SEC seconds of ambient audio and return a threshold
-    set safely above the measured noise floor.
-    """
     block_size = int(SAMPLE_RATE * BLOCK_DURATION)
-    n_blocks   = int(CALIBRATION_SEC / BLOCK_DURATION)
-    energies   = []
+    n_blocks = int(CALIBRATION_SEC / BLOCK_DURATION)
+    energies = []
 
     print(f"Calibrating… stay silent for {CALIBRATION_SEC:.0f}s", flush=True)
 
@@ -215,33 +340,64 @@ def _calibrate(debug: bool = False) -> float:
             rms = float(np.sqrt(np.mean(block.flatten() ** 2)))
             energies.append(rms)
 
-    # Use 95th percentile so the occasional spike doesn't inflate the floor
     noise_floor = float(np.percentile(energies, 95))
-    threshold   = noise_floor * THRESHOLD_MULTIPLIER
-    threshold   = max(THRESHOLD_FLOOR, min(THRESHOLD_CEIL, threshold))
+    threshold = noise_floor * THRESHOLD_MULTIPLIER
+    threshold = max(THRESHOLD_FLOOR, min(THRESHOLD_CEIL, threshold))
 
     if debug:
-        print(
-            f"[calibrate] noise_floor(p95)={noise_floor:.5f} → "
-            f"threshold={threshold:.5f}"
-        )
+        print(f"[calibrate] noise_floor(p95)={noise_floor:.5f} → threshold={threshold:.5f}")
     else:
         print(f"[calibrate] threshold set to {threshold:.4f}")
 
     return threshold
 
-def _listen_generator(debug: bool = False, cleaned: bool = True):
-    # Measure the room noise floor before opening the main mic stream
+#  CORE GENERATOR 
+
+def _silence_timeout_for_clip(clip_elapsed: float, pending_force_commit: bool) -> float:
+    """
+    Dynamic endpointing:
+    - normal clips use standard silence timeout
+    - once the soft cap is exceeded, commit on the next short pause
+    """
+    if pending_force_commit:
+        return FORCE_COMMIT_SILENCE_TIMEOUT
+    if clip_elapsed < 3.0:
+        return 1.0
+    if clip_elapsed < 10.0:
+        return SILENCE_TIMEOUT
+    if clip_elapsed < MAX_RECORDING_SEC_STREAM:
+        return 1.5
+    return 1.8
+
+
+def _listen_generator(
+    debug: bool = False,
+    cleaned: bool = True,
+):
     energy_threshold = _calibrate(debug=debug)
 
     audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
 
-    # VAD state
-    recording:    list  = []
-    is_recording: bool  = False
+    recording: list = []  # list[np.ndarray]
+    recording_samples: int = 0
+    is_recording: bool = False
     silence_time: float = 0.0
-    speech_frames: int  = 0
+    clip_elapsed: float = 0.0
+    speech_frames: int = 0
+    pending_force_commit: bool = False
     pre_roll = deque(maxlen=PRE_ROLL_FRAMES)
+
+    def reset_state():
+        nonlocal recording, recording_samples, is_recording, silence_time
+        nonlocal clip_elapsed, speech_frames, pending_force_commit
+        recording = []
+        recording_samples = 0
+        is_recording = False
+        silence_time = 0.0
+        clip_elapsed = 0.0
+        speech_frames = 0
+        pending_force_commit = False
+        pre_roll.clear()
 
     def audio_callback(indata, frames, time_info, status):
         if status:
@@ -256,26 +412,19 @@ def _listen_generator(debug: bool = False, cleaned: bool = True):
         callback=audio_callback,
     ):
         while True:
-            # Timeout allows KeyboardInterrupt to surface cleanly
             try:
                 chunk = audio_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            # FIX: catch unexpected errors inside the loop so state is reset
-            # cleanly instead of the generator silently hanging.
             except Exception as e:
-                print(f"[error] audio queue error: {e}")
-                recording, is_recording = [], False
-                silence_time, speech_frames = 0.0, 0
-                pre_roll.clear()
+                print(f"[error] audio queue: {e}")
+                reset_state()
                 continue
 
             try:
-                audio  = chunk.flatten()
+                audio = chunk.flatten()
                 energy = float(np.sqrt(np.mean(audio ** 2)))
-                above  = energy >= energy_threshold
-
-                # Two-gate: energy first (cheap), then WebRTC VAD (only if loud)
+                above = energy >= energy_threshold
                 voice = above and _is_voice(audio)
 
                 if debug:
@@ -284,109 +433,110 @@ def _listen_generator(debug: bool = False, cleaned: bool = True):
                     print(
                         f"[DBG] E={energy:.4f} T={energy_threshold:.4f} "
                         f"rec={int(is_recording)} sf={speech_frames:02d} "
-                        f"sil={silence_time:.2f}s [{tag}] | {bar}"
+                        f"sil={silence_time:.2f}s el={clip_elapsed:.2f}s "
+                        f"pend={int(pending_force_commit)} [{tag}] | {bar}"
                     )
 
-                # SPEECH BRANCH
+                #  SPEECH BRANCH 
                 if above:
-                    # Count any loud frame toward the onset accumulator (energy is
-                    # a reliable onset detector; VAD can reject word-initial frames
-                    # at high aggressiveness before steady voicing is established)
                     speech_frames += 1
-                    pre_roll.append(audio.copy())
+                    pre_roll.append(audio)
 
                     if not is_recording:
-                        # Only open recording once we have enough loud frames AND
-                        # the current frame is confirmed voice by WebRTC VAD
                         if speech_frames >= MIN_SPEECH_FRAMES and voice:
                             is_recording = True
-                            recording    = []
-                            for frame in pre_roll:
-                                recording.extend(frame)
+                            recording = list(pre_roll)
+                            recording_samples = sum(len(f) for f in recording)
+                            clip_elapsed = recording_samples / SAMPLE_RATE
                             if debug:
                                 print("[DBG] ▶ Recording started")
                     else:
-                        # Already recording — add every loud frame regardless of
-                        # VAD (unvoiced consonants, plosives, etc. must be kept)
-                        recording.extend(audio)
+                        recording.append(audio)
+                        recording_samples += len(audio)
+                        clip_elapsed += BLOCK_DURATION
                         silence_time = 0.0
 
-                # SILENCE BRANCH
-                else:  # not above threshold
-                    # Gradual decay prevents a single quiet frame from resetting
-                    # the detector mid-word
+                #  SILENCE BRANCH 
+                else:
                     speech_frames = max(0, speech_frames - 1)
-                    pre_roll.append(audio.copy())
+                    pre_roll.append(audio)
 
                     if is_recording:
-                        recording.extend(audio)  # keep trailing silence
+                        recording.append(audio)
+                        recording_samples += len(audio)
+                        clip_elapsed += BLOCK_DURATION
                         silence_time += BLOCK_DURATION
 
                         if debug:
                             print(f"[DBG] silence_time={silence_time:.2f}s")
 
-                # COMMIT BRANCH
-                if is_recording and silence_time >= SILENCE_TIMEOUT:
-                    total_sec = len(recording) / SAMPLE_RATE
+                #  SOFT CAP ARMING 
+                if (
+                    is_recording
+                    and clip_elapsed >= MAX_RECORDING_SEC_STREAM
+                ):
+                    pending_force_commit = True
+
+                #  COMMIT BRANCH 
+                current_silence_timeout = _silence_timeout_for_clip(
+                    clip_elapsed=clip_elapsed,
+                    pending_force_commit=pending_force_commit,
+                )
+
+                should_commit = is_recording and silence_time >= current_silence_timeout
+
+                if should_commit:
+                    total_sec = recording_samples / SAMPLE_RATE
                     if debug:
                         print(f"[DBG] ⏹ Committing {total_sec:.2f}s of audio")
 
                     text = ""
                     if total_sec >= MIN_SPEECH_SEC:
-                        fd, wav_path = tempfile.mkstemp(suffix=".wav")
-                        os.close(fd)
-                        try:
-                            _frames_to_wav(recording, wav_path)
-                            text = _transcribe_wav(wav_path, cleaned)
-                        finally:
-                            try:
-                                os.remove(wav_path)
-                            except FileNotFoundError:
-                                pass
+                        text = _transcribe(recording, cleaned)
                     elif debug:
                         print(f"[DBG] Skipped — too short ({total_sec:.2f}s)")
 
                     if debug:
                         print(f"[DBG] transcript={text!r}")
 
-                    # Reset all state
-                    recording     = []
-                    is_recording  = False
-                    silence_time  = 0.0
-                    speech_frames = 0
-                    pre_roll.clear()
+                    reset_state()
 
                     if text:
                         yield text
 
-            # FIX: catch errors inside the processing block so one bad audio
-            # chunk doesn't silently kill the generator.
             except Exception as e:
-                print(f"[error] processing error: {e}")
-                recording, is_recording = [], False
-                silence_time, speech_frames = 0.0, 0
-                pre_roll.clear()
+                print(f"[error] processing: {e}")
+                reset_state()
 
-# PUBLIC API
+#  PUBLIC API 
+
 def listen(
     as_module: bool = True,
-    once:      bool = False,
-    debug:     bool = False,
-    cleaned:   bool = True,
+    once: bool = False,
+    debug: bool = False,
+    cleaned: bool = True,
 ):
     """
     as_module=True  → return a generator, or a single string if once=True
     as_module=False → print transcripts to stdout until Ctrl-C
     once=True       → stop after the first transcript
+                     (no forced max-clip cutoff; preserves utterance completeness)
     """
     if debug:
         print(f"Using model:  {MODEL_PATH}")
         print(f"Using binary: {WHISPER_PATH}")
 
+    if not _server._ready:
+        if _server.available:
+            _server.start(debug=debug)
+        else:
+            print(
+                "[warn] whisper-server binary not found — using subprocess mode.\n"
+                "[warn] Rebuild with WHISPER_BUILD_EXAMPLES=ON for faster transcription."
+            )
+
     if as_module:
         if once:
-            # FIX: explicitly close the generator so the InputStream is released
-            # immediately rather than waiting for garbage collection.
             gen = _listen_generator(debug=debug, cleaned=cleaned)
             try:
                 return next(gen, "")
@@ -409,6 +559,7 @@ def listen(
                 print(text)
     except KeyboardInterrupt:
         print("\nStopped.")
+
 
 if __name__ == "__main__":
     listen(as_module=False, once=False, debug=True, cleaned=False)

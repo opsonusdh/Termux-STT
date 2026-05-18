@@ -1,25 +1,46 @@
 #!/data/data/com.termux/files/usr/bin/bash
-# FIX: exit immediately on any error so a failed build does not silently
-# continue to download_model.sh and leave the user with a model but no binary.
+
 set -euo pipefail
 
+
 pkg update -y
-pkg install -y git cmake make clang python ffmpeg termux-api portaudio
-pkg install -y python-numpy
+pkg upgrade -y
+
+pkg install -y \
+    git cmake make clang \
+    python python-numpy \
+    ffmpeg termux-api portaudio which
 
 pip install -r requirements.txt --break-system-packages
+
+echo -e "\nTesting microphone permission.\nAccept the popup if appeared."
+TMP_MIC_FILE="$HOME/.termux_stt_mic_test.wav"
+
+termux-microphone-record -f "$TMP_MIC_FILE" -l 1
+
+sleep 2
+
+rm -f "$TMP_MIC_FILE"
 
 if [ ! -d "whisper.cpp" ]; then
     git clone https://github.com/ggerganov/whisper.cpp
 fi
 
 cd whisper.cpp || exit 1
+rm -rf build
 
-# FIX: build in Release mode for significantly faster inference on Android.
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j"$(nproc)"
 
+cmake -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DWHISPER_BUILD_EXAMPLES=ON \
+    -DCMAKE_C_FLAGS="-march=native" \
+    -DCMAKE_CXX_FLAGS="-march=native"
+
+cmake --build build -j "$(nproc)"
+
+echo ""
 cd ..
 
 chmod +x download_model.sh
 ./download_model.sh
+ 
