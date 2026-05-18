@@ -137,9 +137,7 @@ def _is_voice(audio: np.ndarray) -> bool:
                 speech += 1
         except Exception:
             speech += 1
-    if total == 0:
-        return False
-    return (speech / total) >= VAD_SPEECH_RATIO
+    return (speech / total) >= VAD_SPEECH_RATIO if total else False
 
 #  AUDIO / WAV 
 
@@ -147,10 +145,15 @@ def _frames_to_wav_bytes(frames: list) -> bytes:
     """
     Convert a list of float32 numpy chunks to WAV bytes held in memory.
     """
-    audio = np.concatenate(frames).astype(np.float32) if frames else np.array([], dtype=np.float32)
+    if not frames:
+        audio = np.array([], dtype=np.float32)
+    else:
+        audio = np.concatenate(frames, dtype=np.float32)
+    
     peak = np.abs(audio).max() if audio.size else 0.0
     if peak > 1e-6:
-        audio = audio * min(1.0, 0.9 / peak)
+        audio *= min(1.0, 0.9 / peak)
+    
     int_audio = (audio * 32767).astype(np.int16)
     buf = io.BytesIO()
     with wave.open(buf, "wb") as wf:
@@ -170,6 +173,7 @@ class _WhisperServer:
     def __init__(self):
         self._proc = None
         self._ready = False
+        self._conn = None
         _bin = BASE_DIR / "whisper.cpp" / "build" / "bin" / "whisper-server"
         self._bin = str(_bin) if _bin.exists() else None
 
@@ -210,15 +214,17 @@ class _WhisperServer:
                 print("[server] process exited unexpectedly during startup")
                 return False
             try:
-                conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=1)
-                conn.request("GET", "/health")
-                resp = conn.getresponse()
+                if self._conn is None:
+                    self._conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=1)
+                self._conn.request("GET", "/health")
+                resp = self._conn.getresponse()
                 resp.read()
                 if resp.status == 200:
                     self._ready = True
                     print("[server] whisper-server ready")
+                    return True
             except Exception:
-                pass
+                self._conn = None
             time.sleep(0.5)
 
         print("[server] timed out waiting for ready — falling back to subprocess mode")
@@ -237,8 +243,10 @@ class _WhisperServer:
         body = header + wav_bytes + footer
 
         try:
-            conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=30)
-            conn.request(
+            if self._conn is None:
+                self._conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=30)
+            
+            self._conn.request(
                 "POST", "/inference",
                 body=body,
                 headers={
@@ -246,7 +254,7 @@ class _WhisperServer:
                     "Content-Length": str(len(body)),
                 },
             )
-            resp = conn.getresponse()
+            resp = self._conn.getresponse()
             raw = resp.read().decode("utf-8")
             if resp.status == 200:
                 text = json.loads(raw).get("text", "").strip()
@@ -255,10 +263,17 @@ class _WhisperServer:
         except Exception as e:
             print(f"[server] request failed: {e} — marking unhealthy")
             self._ready = False
+            self._conn = None
 
         return ""
 
     def stop(self):
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+            self._conn = None
         if self._proc:
             try:
                 self._proc.terminate()
@@ -364,6 +379,13 @@ def _calibrate(debug: bool = False) -> float:
 
 #  CORE GENERATOR 
 
+# Pre-compute silence timeout thresholds for faster lookup in hot loop
+_SILENCE_THRESHOLDS = [
+    (3.0, 1.0),
+    (10.0, 1.5),
+    (MAX_RECORDING_SEC_STREAM, 1.8),
+]
+
 def _silence_timeout_for_clip(clip_elapsed: float, pending_force_commit: bool) -> float:
     """
     Dynamic endpointing:
@@ -372,12 +394,9 @@ def _silence_timeout_for_clip(clip_elapsed: float, pending_force_commit: bool) -
     """
     if pending_force_commit:
         return FORCE_COMMIT_SILENCE_TIMEOUT
-    if clip_elapsed < 3.0:
-        return 1.0
-    if clip_elapsed < 10.0:
-        return SILENCE_TIMEOUT
-    if clip_elapsed < MAX_RECORDING_SEC_STREAM:
-        return 1.5
+    for threshold, timeout in _SILENCE_THRESHOLDS:
+        if clip_elapsed < threshold:
+            return timeout
     return 1.8
 
 
@@ -388,7 +407,12 @@ def _listen_generator(
 ):
     if energy_threshold is None:
         energy_threshold = _calibrate(debug=debug)
+    
     audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+    
+    # Cache frequently accessed values
+    _is_voice_func = _is_voice
+    _vad_available = _VAD_AVAILABLE
 
     recording: list = []  # list[np.ndarray]
     recording_samples: int = 0
@@ -437,7 +461,7 @@ def _listen_generator(
                 audio = chunk.flatten()
                 energy = float(np.sqrt(np.mean(audio ** 2)))
                 above = energy >= energy_threshold
-                voice = above and _is_voice(audio)
+                voice = above and _is_voice_func(audio)
 
                 if debug:
                     bar = "█" * int(min(energy * 300, 40))
