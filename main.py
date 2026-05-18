@@ -180,6 +180,8 @@ class _WhisperServer:
     def start(self, debug: bool = False) -> bool:
         if not self.available:
             return False
+        if self.healthy():
+            return True
 
         cmd = [
             self._bin,
@@ -266,6 +268,13 @@ class _WhisperServer:
                 pass
             self._proc = None
         self._ready = False
+    
+    def healthy(self) -> bool:
+        return (
+            self._ready
+            and self._proc is not None
+            and self._proc.poll() is None
+        )
 
 
 _server = _WhisperServer()
@@ -279,7 +288,10 @@ def _transcribe(frames: list, cleaned: bool = True) -> str:
     """
     wav_bytes = _frames_to_wav_bytes(frames)
 
-    if _server._ready:
+    if not _server.healthy() and _server.available:
+        _server.start()
+
+    if _server.healthy():
         return _server.transcribe(wav_bytes, cleaned)
 
     fd, wav_path = tempfile.mkstemp(suffix=".wav")
@@ -488,7 +500,7 @@ def _listen_generator(
                 if should_commit:
                     total_sec = recording_samples / SAMPLE_RATE
                     if debug:
-                        print(f"[DBG] ⏹ Committing {total_sec:.2f}s of audio")
+                        print(f"[DBG] Committing {total_sec:.2f}s of audio")
 
                     text = ""
                     if total_sec >= MIN_SPEECH_SEC:
