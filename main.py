@@ -41,19 +41,25 @@ SILENCE_TIMEOUT = 1.5
 MAX_RECORDING_SEC_STREAM = 20.0
 FORCE_COMMIT_SILENCE_TIMEOUT = 0.35
 
+# Audio queue: bounded to prevent unbounded RAM growth during realtime processing.
+# If transcription stalls (CPU throttle, server delay, long speech), queue won't grow infinitely.
+# Drops oldest frames when full to preserve freshest audio and maintain low latency.
+MAX_AUDIO_QUEUE_SIZE = 5
+
 MIN_SPEECH_SEC = 0.5
 ENERGY_THRESHOLD = 0.02
 MIN_SPEECH_FRAMES = 1
 PRE_ROLL_FRAMES = 6
 
-# Snapdragon cores are not a suggestion.
-WHISPER_THREADS = 2
+# Adaptive thread scaling: use half available cores, capped at 2-8
+# Ensures stability across weak (2-4 cores) and strong (8+ cores) devices
+WHISPER_THREADS = min(max(2, (os.cpu_count() or 2) // 2), 8)
 
 # CALIBRATION
 CALIBRATION_SEC = 1.5
 THRESHOLD_MULTIPLIER = 3.0
 THRESHOLD_FLOOR = 0.015
-THRESHOLD_CEIL = 0.12
+THRESHOLD_CEIL = 0.07
 
 # webrtcvad
 VAD_AGGRESSIVENESS = 2
@@ -173,7 +179,6 @@ class _WhisperServer:
     def __init__(self):
         self._proc = None
         self._ready = False
-        self._conn = None
         _bin = BASE_DIR / "whisper.cpp" / "build" / "bin" / "whisper-server"
         self._bin = str(_bin) if _bin.exists() else None
 
@@ -214,17 +219,17 @@ class _WhisperServer:
                 print("[server] process exited unexpectedly during startup")
                 return False
             try:
-                if self._conn is None:
-                    self._conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=1)
-                self._conn.request("GET", "/health")
-                resp = self._conn.getresponse()
+                conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=1)
+                conn.request("GET", "/health")
+                resp = conn.getresponse()
                 resp.read()
+                conn.close()
                 if resp.status == 200:
                     self._ready = True
                     print("[server] whisper-server ready")
                     return True
             except Exception:
-                self._conn = None
+                pass
             time.sleep(0.5)
 
         print("[server] timed out waiting for ready — falling back to subprocess mode")
@@ -243,10 +248,8 @@ class _WhisperServer:
         body = header + wav_bytes + footer
 
         try:
-            if self._conn is None:
-                self._conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=30)
-            
-            self._conn.request(
+            conn = http.client.HTTPConnection(_SERVER_HOST, _SERVER_PORT, timeout=30)
+            conn.request(
                 "POST", "/inference",
                 body=body,
                 headers={
@@ -254,8 +257,9 @@ class _WhisperServer:
                     "Content-Length": str(len(body)),
                 },
             )
-            resp = self._conn.getresponse()
+            resp = conn.getresponse()
             raw = resp.read().decode("utf-8")
+            conn.close()
             if resp.status == 200:
                 text = json.loads(raw).get("text", "").strip()
                 return _clean_text(text) if cleaned else text
@@ -263,17 +267,10 @@ class _WhisperServer:
         except Exception as e:
             print(f"[server] request failed: {e} — marking unhealthy")
             self._ready = False
-            self._conn = None
 
         return ""
 
     def stop(self):
-        if self._conn:
-            try:
-                self._conn.close()
-            except Exception:
-                pass
-            self._conn = None
         if self._proc:
             try:
                 self._proc.terminate()
@@ -408,7 +405,8 @@ def _listen_generator(
     if energy_threshold is None:
         energy_threshold = _calibrate(debug=debug)
     
-    audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
+    # Bounded queue with overflow-on-full policy: discard oldest frames to maintain realtime responsiveness
+    audio_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=MAX_AUDIO_QUEUE_SIZE)
     
     # Cache frequently accessed values
     _is_voice_func = _is_voice
@@ -438,7 +436,13 @@ def _listen_generator(
     def audio_callback(indata, frames, time_info, status):
         if status:
             print(f"[audio] {status}")
-        audio_queue.put(indata.copy())
+        # Drop oldest frame if queue is full to prevent unbounded growth
+        if audio_queue.full():
+            try:
+                audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+        audio_queue.put_nowait(indata.copy())
 
     with sd.InputStream(
         samplerate=SAMPLE_RATE,

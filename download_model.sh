@@ -28,7 +28,7 @@ echo ""
 echo -e "${BOLD}Choose Whisper model quality:${RESET}"
 echo ""
 
-echo -e " 0) ${BOLD}Close${RESET}                -> Exit installer"
+echo -e " 0) ${BOLD}Close${RESET}               -> Exit installer"
 
 echo -e " 1) ${C_TINY}tiny${RESET}                -> fastest multilingual"
 echo -e " 2) ${C_TINY_EN}tiny.en${RESET}             -> fastest English-only"
