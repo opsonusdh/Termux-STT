@@ -34,7 +34,7 @@ CHANNELS = 1
 BLOCK_DURATION = 0.10  # 100 ms blocks
 
 # Normal endpointing: wait for silence before committing.
-SILENCE_TIMEOUT = 1.2
+SILENCE_TIMEOUT = 1.5
 
 # When the stream grows too long, we do NOT cut mid-word.
 # We only arm a pending commit and then wait for the next silence edge.
@@ -216,8 +216,7 @@ class _WhisperServer:
                 resp.read()
                 if resp.status == 200:
                     self._ready = True
-                    print("[server] whisper-server ready — model loaded once, zero per-clip overhead ✓")
-                    return True
+                    print("[server] whisper-server ready")
             except Exception:
                 pass
             time.sleep(0.5)
@@ -385,9 +384,10 @@ def _silence_timeout_for_clip(clip_elapsed: float, pending_force_commit: bool) -
 def _listen_generator(
     debug: bool = False,
     cleaned: bool = True,
+    energy_threshold = None,
 ):
-    energy_threshold = _calibrate(debug=debug)
-
+    if energy_threshold is None:
+        energy_threshold = _calibrate(debug=debug)
     audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()
 
     recording: list = []  # list[np.ndarray]
@@ -527,6 +527,7 @@ def listen(
     once: bool = False,
     debug: bool = False,
     cleaned: bool = True,
+    calibrate_once: bool = True,
 ):
     """
     as_module=True  → return a generator, or a single string if once=True
@@ -547,18 +548,20 @@ def listen(
                 "[warn] Rebuild with WHISPER_BUILD_EXAMPLES=ON for faster transcription."
             )
 
+    if calibrate_once:
+        energy_threshold = _calibrate(debug=debug)
     if as_module:
         if once:
-            gen = _listen_generator(debug=debug, cleaned=cleaned)
+            gen = _listen_generator(debug=debug, cleaned=cleaned, energy_threshold=energy_threshold if calibrate_once else None)
             try:
                 return next(gen, "")
             finally:
                 gen.close()
-        return _listen_generator(debug=debug, cleaned=cleaned)
+        return _listen_generator(debug=debug, cleaned=cleaned, energy_threshold=energy_threshold if calibrate_once else None)
 
     print("Listening… (Ctrl-C to stop)\n")
     try:
-        gen = _listen_generator(debug=debug, cleaned=cleaned)
+        gen = _listen_generator(debug=debug, cleaned=cleaned, energy_threshold=energy_threshold if calibrate_once else None)
         if once:
             try:
                 text = next(gen, "")
