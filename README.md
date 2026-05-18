@@ -30,12 +30,9 @@ Install the App Termux and Termux-api:
 
 Then install the package inside Termux:
 ```bash
-pkg install git termux-api
-termux-speech-to-text
+pkg install git python termux-api
 ```
-Grant microphone permission when prompted.
-
-Then Clone the repo:
+Clone the repo:
 ```bash
 git clone https://github.com/opsonusdh/Termux-STT/
 cd Termux-STT/
@@ -54,9 +51,10 @@ This script will:
 
 - Install required Termux packages
 - Install Python dependencies
+- Ask microphone permission
 - Clone `whisper.cpp`
 - Build whisper.cpp binaries
-- Download the Tiny English Whisper model
+- Download the Whisper model of your choice
 
 The initial setup may take several minutes depending on your device performance and internet connection.
 
