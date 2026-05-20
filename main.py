@@ -59,7 +59,7 @@ WHISPER_THREADS = min(max(2, (os.cpu_count() or 2) // 2), 8)
 CALIBRATION_SEC = 1.5
 THRESHOLD_MULTIPLIER = 3.0
 THRESHOLD_FLOOR = 0.015
-THRESHOLD_CEIL = 0.07
+THRESHOLD_CEIL = 0.2
 
 # webrtcvad
 VAD_AGGRESSIVENESS = 2
@@ -363,7 +363,7 @@ def _calibrate(debug: bool = False) -> float:
             rms = float(np.sqrt(np.mean(block.flatten() ** 2)))
             energies.append(rms)
 
-    noise_floor = float(np.percentile(energies, 95))
+    noise_floor = float(np.median(energies))
     threshold = noise_floor * THRESHOLD_MULTIPLIER
     threshold = max(THRESHOLD_FLOOR, min(THRESHOLD_CEIL, threshold))
 
@@ -605,4 +605,4 @@ def listen(
 
 
 if __name__ == "__main__":
-    listen(as_module=False, once=False, debug=True, cleaned=False)
+    listen(as_module=False, once=False, debug=True, cleaned=False, calibrate_once=True)
