@@ -62,6 +62,18 @@ Some older devices may take longer during compilation because compiling C++ on a
 
 ---
 
+## Groq support
+If you want faster transcription with high precision, you can use groq.
+just do:
+```bash
+nano api.keys
+```
+here add all groq API keys you have:
+```text
+gsk_
+gsk_
+...
+```
 ## Run
 
 Start the application:
@@ -90,40 +102,13 @@ The entire pipeline runs offline after setup.
 
 ---
 
-## Configuration
-
-You can adjust sensitivity settings inside `main.py`.
-
-Example:
-
-```python
-ENERGY_THRESHOLD = 0.03
-```
-### Lower values
-- Increase microphone sensitivity
-- Detect quieter voices more easily
-- Increase the chance of false triggers from background noise
-
-### Higher values
-- Reduce microphone sensitivity
-- Filter background noise more effectively
-- May ignore softer speech
-
-Recommended range:
-
-```python
-0.02 - 0.05
-```
-A quieter room can use lower values, while noisy environments usually require higher thresholds.
-
----
-
 ## Project Structure
 
 ```text
 Termux-STT/
 ├── main.py
 ├── requirements.txt
+├── download_model.sh
 └── setup.sh
 ```
 
@@ -157,6 +142,8 @@ Sounds such as keyboards, fans, traffic, birds, or other environmental noise may
   https://github.com/ggerganov/whisper.cpp
 
 - OpenAI Whisper
+
+- Groq
 
 ---
 
