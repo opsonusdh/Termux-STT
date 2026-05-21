@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+export ANDROID_API_LEVEL=24
 
 pkg update -y
 pkg upgrade -y
@@ -9,7 +10,10 @@ pkg upgrade -y
 pkg install -y \
     git cmake make clang \
     python python-numpy \
-    ffmpeg termux-api portaudio which
+    ffmpeg termux-api portaudio \
+    which rust
+
+pip install openai
 
 pip install -r requirements.txt --break-system-packages
 
