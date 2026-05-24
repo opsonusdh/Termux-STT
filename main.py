@@ -80,7 +80,7 @@ _SERVER_PORT = 8178
 
 # Groq
 GROQ_BASE_URL = "https://api.groq.com/openai/v1"
-GROQ_MODEL = "distil-whisper-large-v3-en"
+GROQ_MODEL = "whisper-large-v3"
 GROQ_RESPONSE_FORMAT = "text"
 GROQ_LANGUAGE = "en"
 
