@@ -44,7 +44,7 @@ CHANNELS = 1
 BLOCK_DURATION = 0.10  # 100 ms blocks
 
 # Normal endpointing: wait for silence before committing.
-SILENCE_TIMEOUT = 1.5
+SILENCE_TIMEOUT = 2
 
 # When the stream grows too long, we do NOT cut mid-word.
 # We only arm a pending commit and then wait for the next silence edge.
