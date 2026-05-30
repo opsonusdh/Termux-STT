@@ -827,8 +827,7 @@ def listen(
         energy_threshold = float(threshold)
         if debug:
             print(f"[calibrate] using supplied threshold={energy_threshold:.4f} (no calibration)")
-        else:
-            print(f"[calibrate] using saved threshold {energy_threshold:.4f}")
+            
     elif calibrate_once:
         energy_threshold = _calibrate(debug=debug)
     else:
