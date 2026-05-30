@@ -74,7 +74,7 @@ THRESHOLD_CEIL = 0.2
 VAD_AGGRESSIVENESS = 2
 VAD_SPEECH_RATIO = 0.7
 
-# Whisper-server (persistent process — eliminates per-clip model-load overhead)
+# Whisper-server (persistent process. eliminates per-clip model-load overhead)
 _SERVER_HOST = "127.0.0.1"
 _SERVER_PORT = 8178
 
@@ -121,7 +121,7 @@ def _resolve_local_whisper() -> bool:
     if _local_whisper_resolved:
         return WHISPER_PATH is not None and MODEL_PATH is not None
 
-    _local_whisper_resolved = True  # mark regardless — don't scan twice on failure
+    _local_whisper_resolved = True  # mark regardless. don't scan twice on failure
 
     for _bin in ("whisper-cli", "main"):
         _p = BASE_DIR / "whisper.cpp" / "build" / "bin" / _bin
@@ -267,10 +267,6 @@ class _GroqTranscriber:
     #  setup 
 
     def setup(self, debug: bool = False) -> bool:
-        """
-        Load keys and verify at least one is present.
-        Call once before the listen loop; returns True when Groq is usable.
-        """
         if not _OPENAI_AVAILABLE:
             return False
 
@@ -309,7 +305,7 @@ class _GroqTranscriber:
 
     @property
     def available(self) -> bool:
-        """True when Groq has keys loaded and is not suspended."""
+        # True when Groq has keys loaded and is not suspended.
         return (
             self._enabled
             and bool(self._keys)
@@ -570,7 +566,7 @@ def _transcribe(frames: list, cleaned: bool = True) -> str:
 
 
 def _transcribe_subprocess(wav_path: str, cleaned: bool = True) -> str:
-    """Original subprocess path. kept as fallback."""
+    # Original subprocess path. kept as fallback.
     cmd = [
         WHISPER_PATH,
         "-m", MODEL_PATH,
@@ -802,6 +798,7 @@ def listen(
     cleaned: bool = True,
     calibrate_once: bool = True,
     use_groq: bool = True,
+    threshold: float | None = None,
 ):
     
     if debug:
@@ -824,11 +821,18 @@ def listen(
         if debug:
             print("[groq] disabled by caller")
 
-
     #  Calibration 
-    energy_threshold = None
-    if calibrate_once:
+    if threshold is not None:
+        # Caller supplied a saved threshold — skip all calibration
+        energy_threshold = float(threshold)
+        if debug:
+            print(f"[calibrate] using supplied threshold={energy_threshold:.4f} (no calibration)")
+        else:
+            print(f"[calibrate] using saved threshold {energy_threshold:.4f}")
+    elif calibrate_once:
         energy_threshold = _calibrate(debug=debug)
+    else:
+        energy_threshold = None  # _listen_generator will calibrate per-clip
 
     #  Run 
     if as_module:
